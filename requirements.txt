@@ -1,0 +1,6 @@
+# Requirements
+Flask==2.3.0
+Flask-CORS==5.0.0
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.23
+pytest==7.4.3
