@@ -1,4 +1,3 @@
-
 class Note:
     def __init__(self, id, title, content, created_at):
         self.id = id

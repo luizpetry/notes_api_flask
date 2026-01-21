@@ -1,7 +1,8 @@
 # Main application file
-from flask import Flask, jsonify, request
-from models.note import Note
+from flask import Flask, jsonify, request 
+from models.note import Note # Importa a class Note do models/note.py
 from datetime import datetime
+from extensions import db, migrate # Importa as instancias/objetos db e migrate de extensions.py
 
 app = Flask(__name__)
 

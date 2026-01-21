@@ -6,7 +6,7 @@ from datetime import datetime
 
 @pytest.fixture
 def client():
-    """Cria um cliente de teste para a aplicação Flask"""
+    # Cria um cliente de teste para a aplicação Flask
     app.config['TESTING'] = True
     with app.test_client() as client:
         yield client
@@ -14,7 +14,7 @@ def client():
 
 @pytest.fixture(autouse=True)
 def reset_state():
-    """Reseta o estado global antes de cada teste"""
+    # Reseta o estado global antes de cada teste
     global notes, id_note_control
     notes.clear()
     id_note_control = 1
@@ -24,10 +24,10 @@ def reset_state():
 
 
 class TestCreateNote:
-    """Testes para criação de notas"""
+    # Testes para criação de notas
     
     def test_create_note_success(self, client):
-        """Testa criação de nota com sucesso"""
+        #  esta criação de nota com sucesso
         response = client.post('/notes', 
                               json={'title': 'Test Note', 'content': 'This is a test note'})
         
@@ -40,7 +40,7 @@ class TestCreateNote:
         assert notes[0].content == 'This is a test note'
     
     def test_create_multiple_notes(self, client):
-        """Testa criação de múltiplas notas com IDs incrementais"""
+        # Testa criação de múltiplas notas com IDs incrementais
         client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
         client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
         client.post('/notes', json={'title': 'Note 3', 'content': 'Content 3'})
@@ -52,10 +52,10 @@ class TestCreateNote:
 
 
 class TestGetNotes:
-    """Testes para listagem de notas"""
+    # Testes para listagem de notas#
     
     def test_get_empty_notes_list(self, client):
-        """Testa listagem quando não há notas"""
+        # Testa listagem quando não há notas
         response = client.get('/notes')
         
         assert response.status_code == 200
@@ -64,8 +64,8 @@ class TestGetNotes:
         assert data['total_notes'] == 0
     
     def test_get_all_notes(self, client):
-        """Testa listagem de todas as notas"""
-        # Cria algumas notas
+        # Testa listagem de todas as notas
+        #  Cria algumas notas
         client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
         client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
         
@@ -80,10 +80,10 @@ class TestGetNotes:
 
 
 class TestGetNoteById:
-    """Testes para buscar nota por ID"""
+    # Testes para buscar nota por ID
     
     def test_get_note_by_id_success(self, client):
-        """Testa busca de nota existente por ID"""
+        # Testa busca de nota existente por ID
         client.post('/notes', json={'title': 'Test Note', 'content': 'Test Content'})
         
         response = client.get('/notes/1')
@@ -96,7 +96,7 @@ class TestGetNoteById:
         assert 'created_at' in data
     
     def test_get_note_by_id_not_found(self, client):
-        """Testa busca de nota inexistente"""
+        # Testa busca de nota inexistente
         response = client.get('/notes/999')
         
         assert response.status_code == 404
@@ -105,10 +105,10 @@ class TestGetNoteById:
 
 
 class TestUpdateNote:
-    """Testes para atualização de notas"""
+    # Testes para atualização de notas#
     
     def test_update_note_success(self, client):
-        """Testa atualização completa de nota"""
+        # Testa atualização completa de nota
         client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
         
         response = client.put('/notes/1', 
@@ -121,27 +121,27 @@ class TestUpdateNote:
         assert notes[0].content == 'Updated Content'
     
     def test_update_note_partial_title(self, client):
-        """Testa atualização apenas do título"""
+        # Testa atualização apenas do título 
         client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
         
         response = client.put('/notes/1', json={'title': 'New Title'})
         
         assert response.status_code == 200
         assert notes[0].title == 'New Title'
-        assert notes[0].content == 'Original Content'  # Não deve mudar
+        assert notes[0].content == 'Original Content'  #  Não deve mudar
     
     def test_update_note_partial_content(self, client):
-        """Testa atualização apenas do conteúdo"""
+        # Testa atualização apenas do conteúdo 
         client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
         
         response = client.put('/notes/1', json={'content': 'New Content'})
         
         assert response.status_code == 200
-        assert notes[0].title == 'Original Title'  # Não deve mudar
+        assert notes[0].title == 'Original Title'  #  Não deve mudar
         assert notes[0].content == 'New Content'
     
     def test_update_note_not_found(self, client):
-        """Testa atualização de nota inexistente"""
+        # Testa atualização de nota inexistente 
         response = client.put('/notes/999', json={'title': 'New Title'})
         
         assert response.status_code == 404
@@ -150,10 +150,10 @@ class TestUpdateNote:
 
 
 class TestDeleteNote:
-    """Testes para deleção de notas"""
+    # Testes para deleção de notas 
     
     def test_delete_note_success(self, client):
-        """Testa deleção de nota existente"""
+        # Testa deleção de nota existente 
         client.post('/notes', json={'title': 'Note to Delete', 'content': 'Content'})
         assert len(notes) == 1
         
@@ -165,7 +165,7 @@ class TestDeleteNote:
         assert len(notes) == 0
     
     def test_delete_note_not_found(self, client):
-        """Testa deleção de nota inexistente"""
+        # Testa deleção de nota inexistente# 
         response = client.delete('/notes/999')
         
         assert response.status_code == 404
@@ -173,7 +173,7 @@ class TestDeleteNote:
         assert data['message'] == 'Note not found'
     
     def test_delete_multiple_notes(self, client):
-        """Testa deleção de múltiplas notas"""
+        # Testa deleção de múltiplas notas# 
         client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
         client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
         client.post('/notes', json={'title': 'Note 3', 'content': 'Content 3'})
@@ -187,10 +187,10 @@ class TestDeleteNote:
 
 
 class TestNoteModel:
-    """Testes para o modelo Note"""
+    # Testes para o modelo Note# 
     
     def test_note_initialization(self):
-        """Testa inicialização do modelo Note"""
+        # Testa inicialização do modelo Note# 
         note = Note(id=1, title='Test', content='Content', created_at=datetime.now())
         
         assert note.id == 1
@@ -199,7 +199,7 @@ class TestNoteModel:
         assert isinstance(note.created_at, datetime)
     
     def test_note_to_dict(self):
-        """Testa conversão de Note para dicionário"""
+        # Testa conversão de Note para dicionário# 
         created_at = datetime.now()
         note = Note(id=1, title='Test', content='Content', created_at=created_at)
         
