@@ -1,212 +1,304 @@
 import pytest
-from app import *
+import werkzeug
+from app import app
+from extensions import db
+from models.user import User
 from models.note import Note
-from datetime import datetime
+from werkzeug.security import generate_password_hash
+
+# Compat: algumas versões recentes do Werkzeug não possuem __version__,
+# mas o Flask espera esse atributo nos testes.
+if not getattr(werkzeug, "__version__", None):
+    werkzeug.__version__ = "3.1.0"
 
 
 @pytest.fixture
 def client():
-    # Cria um cliente de teste para a aplicação Flask
-    app.config['TESTING'] = True
-    with app.test_client() as client:
-        yield client
+    """
+    Configura um app de teste com banco em memória para cada teste.
+    """
+    app.config["TESTING"] = True
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+    with app.app_context():
+        db.create_all()
+
+        # Usuário padrão para autenticação nos testes (garante que não duplica)
+        existing = User.query.filter_by(email="test@example.com").first()
+        if not existing:
+            user = User(
+                name="Test User",
+                email="test@example.com",
+                password_hash=generate_password_hash("password123"),
+            )
+            db.session.add(user)
+            db.session.commit()
+
+        with app.test_client() as client:
+            yield client
+
+        db.session.remove()
+        db.drop_all()
 
 
-@pytest.fixture(autouse=True)
-def reset_state():
-    # Reseta o estado global antes de cada teste
-    global notes, id_note_control
-    notes.clear()
-    id_note_control = 1
-    yield
-    notes.clear()
-    id_note_control = 1
+def get_auth_headers(client, email="test@example.com", password="password123"):
+    """
+    Faz login e retorna o header Authorization com Bearer token.
+    """
+    response = client.post(
+        "/auth/login",
+        json={"email": email, "password": password},
+    )
+    assert response.status_code == 200
+    token = response.get_json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
 
 
-class TestCreateNote:
-    # Testes para criação de notas
-    
+class TestAuth:
+    def test_register_success(self, client):
+        response = client.post(
+            "/auth/register",
+            json={
+                "name": "Novo User",
+                "email": "novo@example.com",
+                "password": "senha123",
+            },
+        )
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data["message"] == "User created successfully"
+
+    def test_register_missing_fields(self, client):
+        response = client.post("/auth/register", json={"email": "no-name@example.com"})
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["message"] == "name, email and password are required"
+
+    def test_register_email_conflict(self, client):
+        # email já existe (criado no fixture)
+        response = client.post(
+            "/auth/register",
+            json={
+                "name": "Outro",
+                "email": "test@example.com",
+                "password": "senha",
+            },
+        )
+        assert response.status_code == 409
+        data = response.get_json()
+        assert data["message"] == "Email already exists"
+
+    def test_login_success(self, client):
+        response = client.post(
+            "/auth/login",
+            json={"email": "test@example.com", "password": "password123"},
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert "access_token" in data
+        assert "user" in data
+        assert data["user"]["email"] == "test@example.com"
+
+    def test_login_missing_fields(self, client):
+        response = client.post("/auth/login", json={"email": "test@example.com"})
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["message"] == "email and password are required"
+
+    def test_login_invalid_credentials(self, client):
+        response = client.post(
+            "/auth/login",
+            json={"email": "test@example.com", "password": "wrong"},
+        )
+        assert response.status_code == 401
+        data = response.get_json()
+        assert data["message"] == "Invalid credentials"
+
+
+class TestNotesCRUD:
     def test_create_note_success(self, client):
-        #  esta criação de nota com sucesso
-        response = client.post('/notes', 
-                              json={'title': 'Test Note', 'content': 'This is a test note'})
-        
+        headers = get_auth_headers(client)
+        response = client.post(
+            "/notes",
+            json={"title": "Test Note", "content": "Content"},
+            headers=headers,
+        )
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data["message"] == "Note created successfully"
+        assert "id" in data
+
+    def test_create_note_missing_title(self, client):
+        headers = get_auth_headers(client)
+        response = client.post(
+            "/notes",
+            json={"content": "Sem título"},
+            headers=headers,
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data["message"] == "Title is required"
+
+    def test_get_notes_empty(self, client):
+        headers = get_auth_headers(client)
+        response = client.get("/notes", headers=headers)
         assert response.status_code == 200
         data = response.get_json()
-        assert data['message'] == 'Note created  successfully'
-        assert data['id'] == 1
-        assert len(notes) == 1
-        assert notes[0].title == 'Test Note'
-        assert notes[0].content == 'This is a test note'
-    
-    def test_create_multiple_notes(self, client):
-        # Testa criação de múltiplas notas com IDs incrementais
-        client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
-        client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
-        client.post('/notes', json={'title': 'Note 3', 'content': 'Content 3'})
-        
-        assert len(notes) == 3
-        assert notes[0].id == 1
-        assert notes[1].id == 2
-        assert notes[2].id == 3
+        assert data["notes"] == []
+        assert data["total_notes"] == 0
 
+    def test_get_notes_with_data(self, client):
+        headers = get_auth_headers(client)
+        # cria duas notas
+        client.post("/notes", json={"title": "N1"}, headers=headers)
+        client.post("/notes", json={"title": "N2"}, headers=headers)
 
-class TestGetNotes:
-    # Testes para listagem de notas#
-    
-    def test_get_empty_notes_list(self, client):
-        # Testa listagem quando não há notas
-        response = client.get('/notes')
-        
+        response = client.get("/notes", headers=headers)
         assert response.status_code == 200
         data = response.get_json()
-        assert data['notes'] == []
-        assert data['total_notes'] == 0
-    
-    def test_get_all_notes(self, client):
-        # Testa listagem de todas as notas
-        #  Cria algumas notas
-        client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
-        client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
-        
-        response = client.get('/notes')
-        
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data['total_notes'] == 2
-        assert len(data['notes']) == 2
-        assert data['notes'][0]['title'] == 'Note 1'
-        assert data['notes'][1]['title'] == 'Note 2'
+        assert data["total_notes"] == 2
+        titles = [n["title"] for n in data["notes"]]
+        assert "N1" in titles and "N2" in titles
 
-
-class TestGetNoteById:
-    # Testes para buscar nota por ID
-    
     def test_get_note_by_id_success(self, client):
-        # Testa busca de nota existente por ID
-        client.post('/notes', json={'title': 'Test Note', 'content': 'Test Content'})
-        
-        response = client.get('/notes/1')
-        
+        headers = get_auth_headers(client)
+        create_resp = client.post(
+            "/notes",
+            json={"title": "Unique", "content": "X"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
+
+        response = client.get(f"/notes/{note_id}", headers=headers)
         assert response.status_code == 200
         data = response.get_json()
-        assert data['id'] == 1
-        assert data['title'] == 'Test Note'
-        assert data['content'] == 'Test Content'
-        assert 'created_at' in data
-    
+        assert data["id"] == note_id
+        assert data["title"] == "Unique"
+
     def test_get_note_by_id_not_found(self, client):
-        # Testa busca de nota inexistente
-        response = client.get('/notes/999')
-        
+        headers = get_auth_headers(client)
+        response = client.get("/notes/999", headers=headers)
         assert response.status_code == 404
-        data = response.get_jsown()
-        assert data['message'] == 'This note ID not found'
+        data = response.get_json()
+        assert data["message"] == "Note not found"
 
-
-class TestUpdateNote:
-    # Testes para atualização de notas#
-    
     def test_update_note_success(self, client):
-        # Testa atualização completa de nota
-        client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
-        
-        response = client.put('/notes/1', 
-                             json={'title': 'Updated Title', 'content': 'Updated Content'})
-        
+        headers = get_auth_headers(client)
+        create_resp = client.post(
+            "/notes",
+            json={"title": "Old", "content": "Old content"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
+
+        response = client.put(
+            f"/notes/{note_id}",
+            json={"title": "New", "content": "New content"},
+            headers=headers,
+        )
         assert response.status_code == 200
         data = response.get_json()
-        assert data['message'] == 'Note has been updated successfully'
-        assert notes[0].title == 'Updated Title'
-        assert notes[0].content == 'Updated Content'
-    
-    def test_update_note_partial_title(self, client):
-        # Testa atualização apenas do título 
-        client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
-        
-        response = client.put('/notes/1', json={'title': 'New Title'})
-        
-        assert response.status_code == 200
-        assert notes[0].title == 'New Title'
-        assert notes[0].content == 'Original Content'  #  Não deve mudar
-    
-    def test_update_note_partial_content(self, client):
-        # Testa atualização apenas do conteúdo 
-        client.post('/notes', json={'title': 'Original Title', 'content': 'Original Content'})
-        
-        response = client.put('/notes/1', json={'content': 'New Content'})
-        
-        assert response.status_code == 200
-        assert notes[0].title == 'Original Title'  #  Não deve mudar
-        assert notes[0].content == 'New Content'
-    
+        assert data["message"] == "Note updated successfully"
+
     def test_update_note_not_found(self, client):
-        # Testa atualização de nota inexistente 
-        response = client.put('/notes/999', json={'title': 'New Title'})
-        
+        headers = get_auth_headers(client)
+        response = client.put(
+            "/notes/999",
+            json={"title": "New"},
+            headers=headers,
+        )
         assert response.status_code == 404
         data = response.get_json()
-        assert data['message'] == 'This note not found'
+        assert data["message"] == "Note not found"
 
+    def test_delete_note_soft(self, client):
+        headers = get_auth_headers(client)
+        create_resp = client.post(
+            "/notes",
+            json={"title": "To delete"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
 
-class TestDeleteNote:
-    # Testes para deleção de notas 
-    
-    def test_delete_note_success(self, client):
-        # Testa deleção de nota existente 
-        client.post('/notes', json={'title': 'Note to Delete', 'content': 'Content'})
-        assert len(notes) == 1
-        
-        response = client.delete('/notes/1')
-        
+        response = client.delete(f"/notes/{note_id}", headers=headers)
         assert response.status_code == 200
         data = response.get_json()
-        assert data['message'] == 'Note has been deleted successfully'
-        assert len(notes) == 0
-    
+        assert data["message"] == "Note moved to trash"
+
     def test_delete_note_not_found(self, client):
-        # Testa deleção de nota inexistente# 
-        response = client.delete('/notes/999')
-        
+        headers = get_auth_headers(client)
+        response = client.delete("/notes/999", headers=headers)
         assert response.status_code == 404
         data = response.get_json()
-        assert data['message'] == 'Note not found'
-    
-    def test_delete_multiple_notes(self, client):
-        # Testa deleção de múltiplas notas# 
-        client.post('/notes', json={'title': 'Note 1', 'content': 'Content 1'})
-        client.post('/notes', json={'title': 'Note 2', 'content': 'Content 2'})
-        client.post('/notes', json={'title': 'Note 3', 'content': 'Content 3'})
-        
-        assert len(notes) == 3
-        
-        client.delete('/notes/2')
-        assert len(notes) == 2
-        assert notes[0].id == 1
-        assert notes[1].id == 3
+        assert data["message"] == "Note not found"
 
 
-class TestNoteModel:
-    # Testes para o modelo Note# 
-    
-    def test_note_initialization(self):
-        # Testa inicialização do modelo Note# 
-        note = Note(id=1, title='Test', content='Content', created_at=datetime.now())
-        
-        assert note.id == 1
-        assert note.title == 'Test'
-        assert note.content == 'Content'
-        assert isinstance(note.created_at, datetime)
-    
-    def test_note_to_dict(self):
-        # Testa conversão de Note para dicionário# 
-        created_at = datetime.now()
-        note = Note(id=1, title='Test', content='Content', created_at=created_at)
-        
-        note_dict = note.to_dict()
-        
-        assert note_dict['id'] == 1
-        assert note_dict['title'] == 'Test'
-        assert note_dict['content'] == 'Content'
-        assert note_dict['created_at'] == created_at
-        assert isinstance(note_dict, dict)
+class TestTrashAndRestore:
+    def test_trash_flow(self, client):
+        headers = get_auth_headers(client)
+
+        # cria nota
+        create_resp = client.post(
+            "/notes",
+            json={"title": "Trash me"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
+
+        # move para lixeira
+        client.delete(f"/notes/{note_id}", headers=headers)
+
+        # lista lixeira
+        trash_resp = client.get("/notes/trash", headers=headers)
+        assert trash_resp.status_code == 200
+        trash_data = trash_resp.get_json()
+        assert trash_data["total_trash"] == 1
+        assert trash_data["trash"][0]["id"] == note_id
+
+        # restaurar
+        restore_resp = client.post(
+            f"/notes/{note_id}/restore",
+            headers=headers,
+        )
+        assert restore_resp.status_code == 200
+        assert restore_resp.get_json()["message"] == "Note restored successfully"
+
+        # lixeira vazia novamente
+        trash_resp2 = client.get("/notes/trash", headers=headers)
+        assert trash_resp2.get_json()["total_trash"] == 0
+
+    def test_restore_not_in_trash(self, client):
+        headers = get_auth_headers(client)
+
+        # cria nota mas não deleta
+        create_resp = client.post(
+            "/notes",
+            json={"title": "Never deleted"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
+
+        resp = client.post(f"/notes/{note_id}/restore", headers=headers)
+        assert resp.status_code == 404
+        data = resp.get_json()
+        assert data["message"] == "Note not found in trash"
+
+    def test_hard_delete(self, client):
+        headers = get_auth_headers(client)
+
+        create_resp = client.post(
+            "/notes",
+            json={"title": "Hard delete"},
+            headers=headers,
+        )
+        note_id = create_resp.get_json()["id"]
+
+        resp = client.delete(f"/notes/{note_id}/hard", headers=headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["message"] == "Note permanently deleted"
+
+        # não deve mais existir
+        get_resp = client.get(f"/notes/{note_id}", headers=headers)
+        assert get_resp.status_code == 404
