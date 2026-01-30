@@ -1,12 +1,13 @@
-__pycache__/
+_pycache__/
 *.pyc
 
 venv/
 .env
+flaskenv/
 
 instance/
 *.db
 *.sqlite
 *.sqlite3
 
-
+text.txt
