@@ -15,6 +15,8 @@ from sqlalchemy import or_
 from flask_cors import CORS
 from dotenv import load_dotenv
 
+from models.reminder import Reminder
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -309,9 +311,106 @@ def toggle_pin(id):
     db.session.commit()
     return jsonify({"message": "Pin updated", "note": note.to_dict()})
 
+# CRUD REMINDERS
+@app.route("/reminders", methods=["POST"])
+@jwt_required()
+def create_reminder():
+    data = request.get_json() or {}
+
+    title = data.get("title")
+    scheduled_at = data.get("scheduled_at")  # ISO string
+    if not title or not scheduled_at:
+        return jsonify({"message": "title and scheduled_at are required"}), 400
+
+    user_id = int(get_jwt_identity())
+
+    try:
+        dt = datetime.fromisoformat(scheduled_at)
+    except ValueError:
+        return jsonify({"message": "scheduled_at must be ISO format"}), 400
+
+    reminder = Reminder(
+        title=title,
+        details=data.get("details", ""),
+        scheduled_at=dt,
+        user_id=user_id,
+    )
+
+    db.session.add(reminder)
+    db.session.commit()
+
+    return jsonify(reminder.to_dict()), 201
+
+
+@app.route("/reminders", methods=["GET"])
+@jwt_required()
+def list_reminders():
+    user_id = int(get_jwt_identity())
+
+    # ordena pelos próximos
+    reminders = (
+        Reminder.query
+        .filter_by(user_id=user_id)
+        .order_by(Reminder.scheduled_at.asc())
+        .all()
+    )
+
+    return jsonify({
+        "reminders": [r.to_dict() for r in reminders],
+        "total": len(reminders),
+    })
+
+
+@app.route("/reminders/<int:id>", methods=["GET"])
+@jwt_required()
+def get_reminder(id):
+    user_id = int(get_jwt_identity())
+    reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
+    if not reminder:
+        return jsonify({"message": "Reminder not found"}), 404
+    return jsonify(reminder.to_dict())
+
+
+@app.route("/reminders/<int:id>", methods=["PUT"])
+@jwt_required()
+def update_reminder(id):
+    user_id = int(get_jwt_identity())
+    reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
+    if not reminder:
+        return jsonify({"message": "Reminder not found"}), 404
+
+    data = request.get_json() or {}
+
+    if "title" in data:
+        reminder.title = data["title"]
+
+    if "details" in data:
+        reminder.details = data["details"]
+
+    if "scheduled_at" in data:
+        try:
+            reminder.scheduled_at = datetime.fromisoformat(data["scheduled_at"])
+        except ValueError:
+            return jsonify({"message": "scheduled_at must be ISO format"}), 400
+
+    db.session.commit()
+    return jsonify(reminder.to_dict())
+
+
+@app.route("/reminders/<int:id>", methods=["DELETE"])
+@jwt_required()
+def delete_reminder(id):
+    user_id = int(get_jwt_identity())
+    reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
+    if not reminder:
+        return jsonify({"message": "Reminder not found"}), 404
+
+    db.session.delete(reminder)
+    db.session.commit()
+    return jsonify({"message": "Reminder deleted"})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", debug=True)
 
 
 
