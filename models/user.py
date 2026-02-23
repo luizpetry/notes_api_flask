@@ -9,9 +9,13 @@ class User(db.Model):
     email = db.Column(db.String(255), unique = True, nullable = False, index = True)
     # hash da senha (nunca retorna em respostas)
     password_hash = db.Column(db.String(255), nullable = False)
-    
+
     # relacionamento: 1 user -> várias notas
     notes = db.relationship("Note", back_populates="user", cascade="all, delete-orphan")
+
+    # REMINDERS
+    reminders = db.relationship("Reminder", back_populates="user", cascade="all, delete-orphan")
+
 
     def to_dict(self):
         return {
