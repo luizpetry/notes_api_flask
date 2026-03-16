@@ -1,27 +1,38 @@
-# Main application file
+# app.py
 import os
-from flask import Flask, jsonify, request 
-from datetime import datetime
-from extensions import db, migrate # Importa as instancias/objetos db e migrate de extensions.py
+import re
+import secrets
+from datetime import datetime, timedelta
 
-from models.note import Note # Importa a class Note do models/note.py
-from models.user import User
-
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy.exc import IntegrityError
-
-from sqlalchemy import or_
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
+
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    jwt_required,
+    get_jwt_identity,
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from extensions import db, migrate
+from models.note import Note
+from models.user import User
 from models.reminder import Reminder
+
+# OTP
+from models.otp import OTP
+from otp_sender import send_code
+
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
-
 
 # Config do DB (SQLite)
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///notes.db")
@@ -30,94 +41,241 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 # Config JWT
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "dev-secret")
 
-# Inicializa as extensões do DB antes de rodar o app / CLI
+# OTP (DEV)
+app.config["DEV_OTP"] = True
+
+# Inicializa extensões
 db.init_app(app)
 migrate.init_app(app, db)
-
 jwt = JWTManager(app)
 
 
-    # ROTAS NOTES
-# CREATE 
-@app.route('/notes', methods=['POST'])
+# ==========================
+# OTP Helpers
+# ==========================
+OTP_TTL_MIN = 10
+MAX_ATTEMPTS = 5
+
+def normalize_phone(phone: str) -> str:
+    phone = (phone or "").strip()
+    phone = re.sub(r"[^\d+]", "", phone)
+    return phone
+
+def gen_otp_code() -> str:
+    return f"{secrets.randbelow(1000000):06d}"
+
+
+# ==========================
+# AUTH (PHONE + OTP)
+# ==========================
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data = request.get_json() or {}
+
+    phone = normalize_phone(data.get("phone"))
+    password = data.get("password", "")
+    confirm = data.get("confirm_password", "")
+
+    if not phone or not password or not confirm:
+        return jsonify({"message": "phone, password and confirm_password are required"}), 400
+    if len(password) < 6:
+        return jsonify({"message": "Password must be at least 6 characters"}), 400
+    if password != confirm:
+        return jsonify({"message": "Passwords do not match"}), 400
+
+    # Se já existe verificado, bloqueia
+    user = User.query.filter_by(phone=phone).first()
+    if user and user.is_verified:
+        return jsonify({"message": "Phone already exists"}), 409
+
+    # Cria usuário (não verificado) ou atualiza senha se já existia não-verificado
+    if not user:
+        user = User(
+            phone=phone,
+            password_hash=generate_password_hash(password),
+            is_verified=False
+        )
+        db.session.add(user)
+        db.session.flush()  # garante user.id
+    else:
+        user.password_hash = generate_password_hash(password)
+
+    # Gera OTP
+    code = gen_otp_code()
+    otp = OTP(
+        user_id=user.id,
+        code_hash=generate_password_hash(code),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MIN),
+        attempts=0,
+    )
+    db.session.add(otp)
+    db.session.commit()
+
+    # Envia (DEV imprime; depois tu troca o plug)
+    send_code(phone, code)
+
+    resp = {"message": "OTP sent"}
+    if app.config.get("DEV_OTP"):
+        resp["dev_code"] = code  # útil em testes
+    return jsonify(resp), 201
+
+
+@app.route("/auth/verify", methods=["POST"])
+def auth_verify():
+    data = request.get_json() or {}
+
+    phone = normalize_phone(data.get("phone"))
+    code = (data.get("code") or "").strip()
+
+    if not phone or not code:
+        return jsonify({"message": "phone and code are required"}), 400
+
+    user = User.query.filter_by(phone=phone).first()
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+
+    otp = OTP.query.filter_by(user_id=user.id).order_by(OTP.created_at.desc()).first()
+    if not otp:
+        return jsonify({"message": "No code found. Resend."}), 400
+    if datetime.utcnow() > otp.expires_at:
+        return jsonify({"message": "Code expired. Resend."}), 400
+    if otp.attempts >= MAX_ATTEMPTS:
+        return jsonify({"message": "Too many attempts. Resend a new code."}), 429
+
+    if not check_password_hash(otp.code_hash, code):
+        otp.attempts += 1
+        db.session.commit()
+        return jsonify({"message": "Invalid code"}), 400
+
+    user.is_verified = True
+    db.session.commit()
+
+    access_token = create_access_token(identity=str(user.id))
+    return jsonify({"access_token": access_token, "user": user.to_dict()}), 200
+
+
+@app.route("/auth/resend", methods=["POST"])
+def auth_resend():
+    data = request.get_json() or {}
+
+    phone = normalize_phone(data.get("phone"))
+    if not phone:
+        return jsonify({"message": "phone is required"}), 400
+
+    user = User.query.filter_by(phone=phone).first()
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+    if user.is_verified:
+        return jsonify({"message": "Already verified"}), 400
+
+    code = gen_otp_code()
+    otp = OTP(
+        user_id=user.id,
+        code_hash=generate_password_hash(code),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MIN),
+        attempts=0,
+    )
+    db.session.add(otp)
+    db.session.commit()
+
+    send_code(phone, code)
+
+    resp = {"message": "OTP resent"}
+    if app.config.get("DEV_OTP"):
+        resp["dev_code"] = code
+    return jsonify(resp), 200
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json() or {}
+
+    phone = normalize_phone(data.get("phone"))
+    password = data.get("password", "")
+
+    if not phone or not password:
+        return jsonify({"message": "phone and password are required"}), 400
+
+    user = User.query.filter_by(phone=phone).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"message": "Invalid credentials"}), 401
+
+    if not user.is_verified:
+        return jsonify({"message": "Account not verified"}), 403
+
+    access_token = create_access_token(identity=str(user.id))
+    return jsonify({"access_token": access_token, "user": user.to_dict()}), 200
+
+
+# ==========================
+# ROTAS NOTES
+# ==========================
+@app.route("/notes", methods=["POST"])
 @jwt_required()
 def create_note():
-    # or: Se o JSON vier vazio ou inválido, usa um dicionário vazio em vez de None.
-    data = request.get_json() or {} # Pega o corpo da requisição e converte para um dicionário
+    data = request.get_json() or {}
 
     title = data.get("title")
     if not title:
         return jsonify({"message": "Title is required"}), 400
 
-    user_id = int(get_jwt_identity()) # Pega o user.id dentro do token
+    user_id = int(get_jwt_identity())
 
     note = Note(
-        title = title,
-        content = data.get("content", ""),
-        created_at = datetime.utcnow(),
-        user_id=user_id
+        title=title,
+        content=data.get("content", ""),
+        created_at=datetime.utcnow(),
+        user_id=user_id,
     )
 
-    # Salva a nota em memoria
     db.session.add(note)
-    # Executa o que esta pendente no banco de dados
     db.session.commit()
 
     return jsonify({"message": "Note created successfully", "id": note.id}), 201
-    
 
-# READ
-@app.route('/notes', methods=['GET'])
-@jwt_required() # Exige token valido
+
+@app.route("/notes", methods=["GET"])
+@jwt_required()
 def get_notes():
     user_id = int(get_jwt_identity())
 
-    search = request.args.get("search")          # texto livre
-    favorite = request.args.get("favorite")      # "true" | "false" | None
-    pinned = request.args.get("pinned")          # "true" | "false" | None
-    sort = request.args.get("sort", "recent")    # recent | oldest
+    search = request.args.get("search")
+    favorite = request.args.get("favorite")
+    pinned = request.args.get("pinned")
+    sort = request.args.get("sort", "recent")
 
     query = Note.query.filter_by(user_id=user_id, deleted_at=None)
 
-    # BUSCA por título ou conteúdo
     if search:
         like = f"%{search}%"
-        query = query.filter(
-            or_(
-                Note.title.ilike(like),
-                Note.content.ilike(like)
-            )
-        )
+        query = query.filter(or_(Note.title.ilike(like), Note.content.ilike(like)))
 
-    # FILTRO FAVORITOS
     if favorite is not None:
         if favorite.lower() == "true":
             query = query.filter(Note.is_favorite.is_(True))
         elif favorite.lower() == "false":
             query = query.filter(Note.is_favorite.is_(False))
 
-    # FILTRO PINNED
     if pinned is not None:
         if pinned.lower() == "true":
             query = query.filter(Note.is_pinned.is_(True))
         elif pinned.lower() == "false":
             query = query.filter(Note.is_pinned.is_(False))
 
-    # ORDENAÇÃO
     if sort == "oldest":
         query = query.order_by(Note.id.asc())
-    else:  
+    else:
         query = query.order_by(Note.is_pinned.desc(), Note.id.desc())
 
     notes = query.all()
 
     return jsonify({
         "notes": [n.to_dict() for n in notes],
-        "total_notes": len(notes)
+        "total_notes": len(notes),
     })
 
-# READ SPECIFIC ID 
-@app.route('/notes/<int:id>', methods=['GET'])
+
+@app.route("/notes/<int:id>", methods=["GET"])
 @jwt_required()
 def get_note(id):
     user_id = int(get_jwt_identity())
@@ -128,99 +286,45 @@ def get_note(id):
 
     return jsonify(note.to_dict())
 
-# UPDATE
-@app.route('/notes/<int:id>', methods=['PUT'])
+
+@app.route("/notes/<int:id>", methods=["PUT"])
 @jwt_required()
 def update_note(id):
     user_id = int(get_jwt_identity())
 
-    # Busca a nota pelo id e pelo dono
-    note = Note.query.filter_by(id=id, user_id=user_id, deleted_at=None).first()
-
-    if not note: # Se nao existir nota ou nao for dele
-        return jsonify({"message": "Note not found"}), 404
-
-    data = request.get_json() or {} 
-
-    # Atualiza só os campos enviados
-    if "title" in data:
-        note.title = data["title"]
-
-    if "content" in data:
-        note.content = data["content"]
-
-    db.session.commit() # Salva no banco
-
-    return jsonify({"message": "Note updated successfully"})
-
-# DELETE
-@app.route("/notes/<int:id>", methods=['DELETE'])
-@jwt_required()
-def delete_note(id):
-    user_id = int(get_jwt_identity())
-                                        # deleted_at=None: você só “deleta” se ela não estiver já na lixeira
     note = Note.query.filter_by(id=id, user_id=user_id, deleted_at=None).first()
     if not note:
         return jsonify({"message": "Note not found"}), 404
 
-    note.deleted_at = datetime.utcnow()  # manda pra lixeira
+    data = request.get_json() or {}
+
+    if "title" in data:
+        note.title = data["title"]
+    if "content" in data:
+        note.content = data["content"]
+
+    db.session.commit()
+    return jsonify({"message": "Note updated successfully"})
+
+
+@app.route("/notes/<int:id>", methods=["DELETE"])
+@jwt_required()
+def delete_note(id):
+    user_id = int(get_jwt_identity())
+
+    note = Note.query.filter_by(id=id, user_id=user_id, deleted_at=None).first()
+    if not note:
+        return jsonify({"message": "Note not found"}), 404
+
+    note.deleted_at = datetime.utcnow()
     db.session.commit()
 
     return jsonify({"message": "Note moved to trash"})
 
 
-#       Rotas de registro e login
-# Register
-@app.route('/auth/register', methods=['POST'])
-def register():
-    data = request.get_json() or {}
-
-    name = data.get('name')
-    email = data.get('email')
-    password = data.get('password')
-
-    if not name or not email or not password:
-        return jsonify({"message": "name, email and password are required"}), 400
-
-    user = User(
-        name=name,
-        email=email,
-        password_hash=generate_password_hash(password) # Usa o werkzeug
-    )
-
-    try:
-        db.session.add(user)
-        db.session.commit()
-    except IntegrityError:
-        # Reverte alteracoes pendentes feitas no banco de dados na transacao atual
-        db.session.rollback()
-        return jsonify({"message": "Email already exists"}), 409
-    
-    return jsonify({"message": "User created successfully"}), 201
-
-
-@app.route('/auth/login', methods=['POST'])
-def login():
-    data = request.get_json() or {}
-
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return jsonify({"message": "email and password are required"}), 400
-
-    user = User.query.filter_by(email=email).first()
-
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"message": "Invalid credentials"}), 401
-
-    access_token = create_access_token(identity=str(user.id))
-
-    return jsonify({"access_token": access_token, "user": user.to_dict()}), 200
-
-
+# ==========================
 # LIXEIRA
-# LISTAR LIXEIRA
+# ==========================
 @app.route("/notes/trash", methods=["GET"])
 @jwt_required()
 def get_trash():
@@ -236,10 +340,28 @@ def get_trash():
 
     return jsonify({
         "trash": [n.to_dict() for n in notes],
-        "total_trash": len(notes)
+        "total_trash": len(notes),
     })
 
-# RESTAURAR NOTA DA LIXEIRA
+# Esvaziar Lixeira
+@app.route("/notes/trash/empty", methods=["DELETE"])
+@jwt_required()
+def empty_trash():
+    user_id = int(get_jwt_identity())
+
+    notes = (
+        Note.query
+        .filter_by(user_id=user_id)
+        .filter(Note.deleted_at.isnot(None))
+        .all()
+    )
+
+    for n in notes:
+        db.session.delete(n)
+
+    db.session.commit()
+    return jsonify({"message": "Trash emptied"}), 200
+
 @app.route("/notes/<int:id>/restore", methods=["POST"])
 @jwt_required()
 def restore_note(id):
@@ -254,7 +376,7 @@ def restore_note(id):
 
     return jsonify({"message": "Note restored successfully"})
 
-# HARD DELETE - APAGAR DA LIXEIRA
+
 @app.route("/notes/<int:id>/hard", methods=["DELETE"])
 @jwt_required()
 def hard_delete_note(id):
@@ -269,8 +391,10 @@ def hard_delete_note(id):
 
     return jsonify({"message": "Note permanently deleted"})
 
-# FAVORITAR/DESFAVORITAR
-        # PATCH envia apenas os campos específicos a serem modificados 
+
+# ==========================
+# FAVORITAR / PIN
+# ==========================
 @app.route("/notes/<int:id>/favorite", methods=["PATCH"])
 @jwt_required()
 def toggle_favorite(id):
@@ -281,7 +405,6 @@ def toggle_favorite(id):
         return jsonify({"message": "Note not found"}), 404
 
     data = request.get_json(silent=True) or {}
-    # Se enviar {"is_favorite": true/false}, usa isso. Se não enviar, inverte (toggle).
     if "is_favorite" in data:
         note.is_favorite = bool(data["is_favorite"])
     else:
@@ -290,8 +413,7 @@ def toggle_favorite(id):
     db.session.commit()
     return jsonify({"message": "Favorite updated", "note": note.to_dict()})
 
-# PIN/UNPIN
-        # PATCH envia apenas os campos específicos a serem modificados 
+
 @app.route("/notes/<int:id>/pin", methods=["PATCH"])
 @jwt_required()
 def toggle_pin(id):
@@ -302,7 +424,6 @@ def toggle_pin(id):
         return jsonify({"message": "Note not found"}), 404
 
     data = request.get_json(silent=True) or {}
-    # Se enviar {"is_pinned": true/false}, usa isso. Se não enviar, inverte (toggle).
     if "is_pinned" in data:
         note.is_pinned = bool(data["is_pinned"])
     else:
@@ -311,14 +432,17 @@ def toggle_pin(id):
     db.session.commit()
     return jsonify({"message": "Pin updated", "note": note.to_dict()})
 
+
+# ==========================
 # CRUD REMINDERS
+# ==========================
 @app.route("/reminders", methods=["POST"])
 @jwt_required()
 def create_reminder():
     data = request.get_json() or {}
 
     title = data.get("title")
-    scheduled_at = data.get("scheduled_at")  # ISO string
+    scheduled_at = data.get("scheduled_at")
     if not title or not scheduled_at:
         return jsonify({"message": "title and scheduled_at are required"}), 400
 
@@ -347,7 +471,6 @@ def create_reminder():
 def list_reminders():
     user_id = int(get_jwt_identity())
 
-    # ordena pelos próximos
     reminders = (
         Reminder.query
         .filter_by(user_id=user_id)
@@ -365,9 +488,11 @@ def list_reminders():
 @jwt_required()
 def get_reminder(id):
     user_id = int(get_jwt_identity())
+
     reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
     if not reminder:
         return jsonify({"message": "Reminder not found"}), 404
+
     return jsonify(reminder.to_dict())
 
 
@@ -375,6 +500,7 @@ def get_reminder(id):
 @jwt_required()
 def update_reminder(id):
     user_id = int(get_jwt_identity())
+
     reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
     if not reminder:
         return jsonify({"message": "Reminder not found"}), 404
@@ -383,7 +509,6 @@ def update_reminder(id):
 
     if "title" in data:
         reminder.title = data["title"]
-
     if "details" in data:
         reminder.details = data["details"]
 
@@ -401,6 +526,7 @@ def update_reminder(id):
 @jwt_required()
 def delete_reminder(id):
     user_id = int(get_jwt_identity())
+
     reminder = Reminder.query.filter_by(id=id, user_id=user_id).first()
     if not reminder:
         return jsonify({"message": "Reminder not found"}), 404
@@ -409,8 +535,6 @@ def delete_reminder(id):
     db.session.commit()
     return jsonify({"message": "Reminder deleted"})
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=True)
-
-
-
+    app.run(host="0.0.0.0", port=5000, debug=True)
