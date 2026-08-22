@@ -1,6 +1,6 @@
-Flask==2.3.0
+Flask==2.3.3
 Flask-CORS==5.0.0
 Flask-SQLAlchemy==3.1.1
-SQLAlchemy==2.0.23
-Flask-Migrate==4.0.5
-pytest==7.4.3
+SQLAlchemy==2.0.52
+Flask-Migrate==4.1.0
+pytest==7.4.4
